@@ -790,10 +790,18 @@ async def sluzba(
 			),
 			color=discord.Color.greyple(),
 		)
-		await interaction.response.send_message(embed=embed, view=RegisterView(target))
+		view = RegisterView(target)
 	else:
 		view = ServiceView(target.id)
-		await interaction.response.send_message(embed=_build_service_embed(record), view=view)
+		embed = _build_service_embed(record)
+
+	channel = interaction.channel
+	if isinstance(channel, discord.TextChannel):
+		await interaction.response.send_message("Složka byla odeslána do kanálu.", ephemeral=True)
+		await channel.send(embed=embed, view=view)
+		return
+
+	await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 def main() -> None:
