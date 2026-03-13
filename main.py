@@ -435,7 +435,7 @@ COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
 				"Tvoji další zprávu bot přepošle jako webhook.\n"
 				"• Bez parametrů → odesláno jako **Los Santos Police Department**.\n"
 				"• S parametry `jméno`/`avatar_url` → otevře se widget pro úpravu.\n"
-				"• Povoleno pro Discord `Manage Messages` nebo  **administrátoryS**.",
+				"• Povoleno pro Discord `Manage Messages` nebo **administrátory**.",
 			),
 		],
 	),
@@ -444,7 +444,7 @@ COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
 		discord.Color.gold(),
 		[
 			("👁️ Auto-reakce", "V určených kanálech bot automaticky reaguje na každou zprávu emoji 👁️."),
-			("📥 Member join/leave", "Každý příchod a odchod člena je zaznamenán v log kanálu."),
+			("📥 Připojení/odchod člena", "Každý příchod a odchod člena je zaznamenán v log kanálu."),
 			("🗑️ Smazané zprávy", "Obsah smazané zprávy je automaticky uložen do logu."),
 			("✏️ Upravené zprávy", "Při editaci zprávy se do logu uloží verze před i po úpravě."),
 			("🧹 Purge log", "Každé použití `/vymazat` se zaznamená s počtem smazaných zpráv."),
@@ -452,12 +452,12 @@ COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
 		],
 	),
 	"sluzba": (
-		"📂 Služobná složka",
+		"📂 Služební složka",
 		discord.Color.green(),
 		[
 			(
 				"/sluzba",
-				"Otevře tvoji osobní služobnou složku s tlačítky ON DUTY / OFF DUTY.\n"
+				"Otevře tvoji osobní služební složku s tlačítky pro nástup/ukončení služby.\n"
 				"• Při prvním použití vyplníš formulář (jméno + číslo odznaku).\n"
 				"• Bot automaticky počítá délku aktuální i celkovou dobu ve službě.\n"
 				"• `/sluzba @člen` – zobrazí složku jiného člena (vyžaduje **mod/admin**).",
@@ -473,7 +473,7 @@ class KategoriePrikazuSelect(discord.ui.Select):
 			discord.SelectOption(label="Moderace", value="moderace", emoji="🛡️", description="kick, ban, timeout, odtimeout"),
 			discord.SelectOption(label="Zprávy", value="zprávy", emoji="✉️", description="vymazat, přepis"),
 			discord.SelectOption(label="Automatizace & logy", value="automatizace", emoji="⚙️", description="auto-reakce, logy"),
-			discord.SelectOption(label="Služobná složka", value="sluzba", emoji="📂", description="/sluzba – ON/OFF DUTY, hodiny"),
+			discord.SelectOption(label="Služební složka", value="sluzba", emoji="📂", description="/sluzba – nástup/ukončení, hodiny"),
 		]
 		super().__init__(placeholder="Vyber kategorii příkazů…", options=options)
 
@@ -507,7 +507,7 @@ def _uvodni_embed() -> discord.Embed:
 		),
 		color=discord.Color.dark_blue(),
 	)
-	embed.add_field(name="Kategorie", value="🛡️ Moderace  •  ✉️ Zprávy  •  ⚙️ Automatizace & logy  •  📂 Služobná složka", inline=False)
+	embed.add_field(name="Kategorie", value="🛡️ Moderace  •  ✉️ Zprávy  •  ⚙️ Automatizace & logy  •  📂 Služební složka", inline=False)
 	embed.set_footer(text="LSPD Bot • Los Santos Police Department")
 	return embed
 
@@ -557,7 +557,7 @@ async def on_message_edit(before: discord.Message, after: discord.Message) -> No
 @bot.event
 async def on_member_join(member: discord.Member) -> None:
 	await bot.log_event(
-		"📥 Member join",
+		"📥 Připojení člena",
 		f"{member.mention} se připojil na server.",
 		discord.Color.green(),
 	)
@@ -566,7 +566,7 @@ async def on_member_join(member: discord.Member) -> None:
 @bot.event
 async def on_member_remove(member: discord.Member) -> None:
 	await bot.log_event(
-		"📤 Member leave",
+		"📤 Odchod člena",
 		f"{member} odešel ze serveru.",
 		discord.Color.dark_grey(),
 	)
@@ -585,6 +585,7 @@ class ServiceRecord:
 	duty_start: datetime | None = None
 	total_minutes: int = 0
 	last_service_end: datetime | None = None
+	last_service_minutes: int = 0
 
 
 duty_records: dict[int, ServiceRecord] = {}
@@ -607,21 +608,21 @@ def _build_service_embed(record: ServiceRecord) -> discord.Embed:
 		doba_value = "—"
 
 	last_service_value = (
-		f"<t:{int(record.last_service_end.timestamp())}:f>"
+		f"<t:{int(record.last_service_end.timestamp())}:f> ({_fmt_duration(record.last_service_minutes)})"
 		if record.last_service_end
 		else "—"
 	)
 
 	status_emoji = "🟢" if record.is_on_duty else "🔴"
-	status_text = "ON DUTY" if record.is_on_duty else "OFF DUTY"
+	status_text = "VE SLUŽBĚ" if record.is_on_duty else "MIMO SLUŽBU"
 	color = discord.Color.green() if record.is_on_duty else discord.Color.dark_grey()
 
-	embed = discord.Embed(title="📂 Služobná složka", color=color)
-	embed.description = f"Deputy: <@{record.user_id}> **[{record.badge}]**"
-	embed.add_field(name=f"{status_emoji} Status", value=status_text, inline=True)
-	embed.add_field(name="⏱️ Doba v službě", value=doba_value, inline=True)
-	embed.add_field(name="📊 Celkovo hodiny", value=_fmt_duration(record.total_minutes), inline=True)
-	embed.add_field(name="🕐 Posledná služba", value=last_service_value, inline=False)
+	embed = discord.Embed(title="📂 Služební složka", color=color)
+	embed.description = f"Příslušník: <@{record.user_id}> **[{record.badge}]**"
+	embed.add_field(name=f"{status_emoji} Stav", value=status_text, inline=True)
+	embed.add_field(name="⏱️ Doba ve službě", value=doba_value, inline=True)
+	embed.add_field(name="📊 Celkem hodin", value=_fmt_duration(record.total_minutes), inline=True)
+	embed.add_field(name="🕐 Poslední služba", value=last_service_value, inline=False)
 	embed.set_footer(text=f"Jméno: {record.name} • Aktualizuje se při interakci")
 	return embed
 
@@ -637,14 +638,14 @@ class ServiceView(discord.ui.View):
 		record = duty_records.get(self.user_id)
 		if record and record.is_on_duty:
 			btn = discord.ui.Button(
-				label="OFF DUTY",
+				label="Ukončit službu",
 				style=discord.ButtonStyle.danger,
 				emoji="🔴",
 			)
 			btn.callback = self._off_duty
 		else:
 			btn = discord.ui.Button(
-				label="ON DUTY",
+				label="Nastoupit do služby",
 				style=discord.ButtonStyle.success,
 				emoji="🟢",
 			)
@@ -670,7 +671,7 @@ class ServiceView(discord.ui.View):
 		await interaction.response.edit_message(embed=_build_service_embed(record), view=self)
 		if record:
 			await bot.log_event(
-				"🟢 ON DUTY",
+				"🟢 Nástup do služby",
 				f"{interaction.user.mention} nastoupil do služby. (složka: <@{self.user_id}> [{record.badge}])",
 				discord.Color.green(),
 			)
@@ -685,13 +686,14 @@ class ServiceView(discord.ui.View):
 			session_min = int((now - record.duty_start).total_seconds() / 60)
 			record.total_minutes += session_min
 			record.last_service_end = now
+			record.last_service_minutes = session_min
 			record.is_on_duty = False
 			record.duty_start = None
 		self._refresh_buttons()
 		await interaction.response.edit_message(embed=_build_service_embed(record), view=self)
 		if record:
 			await bot.log_event(
-				"🔴 OFF DUTY",
+				"🔴 Ukončení služby",
 				f"{interaction.user.mention} ukončil službu. Délka: **{_fmt_duration(session_min if record else 0)}** (složka: <@{self.user_id}> [{record.badge}])",
 				discord.Color.red(),
 			)
@@ -759,7 +761,7 @@ class RegisterView(discord.ui.View):
 				item.disabled = True
 
 
-@bot.tree.command(name="sluzba", description="Otevře tvoji služobnou složku (nebo složku jiného člena – pouze admin)")
+@bot.tree.command(name="sluzba", description="Otevře tvoji služební složku (nebo složku jiného člena – pouze admin)")
 @app_commands.describe(uzivatel="Člen, jehož složku chceš zobrazit (pouze mod/admin)")
 async def sluzba(
 	interaction: discord.Interaction,
@@ -781,7 +783,7 @@ async def sluzba(
 	record = duty_records.get(target.id)
 	if record is None:
 		embed = discord.Embed(
-			title="📂 Služobná složka",
+			title="📂 Služební složka",
 			description=(
 				f"Složka pro {target.mention} ještě nebyla vytvořena.\n"
 				"Klikni na tlačítko níže a vyplň registrační formulář."
