@@ -41,6 +41,12 @@ def _parse_int_set(value: str | None) -> set[int]:
 	return result
 
 
+def _parse_name_set(value: str | None) -> set[str]:
+	if not value:
+		return set()
+	return {item.strip().casefold() for item in value.split(",") if item.strip()}
+
+
 @dataclass(slots=True)
 class RewriteRequest:
 	channel_id: int
@@ -65,6 +71,12 @@ class LSPDBot(commands.Bot):
 		self.log_channel_id = _parse_int(os.getenv("LOG_CHANNEL_ID"))
 		self.auto_eye_channels = _parse_int_set(os.getenv("AUTO_EYE_CHANNEL_IDS"))
 		self.guild_id = _parse_int(os.getenv("GUILD_ID"))
+		self.admin_role_ids = _parse_int_set(os.getenv("ADMIN_ROLE_IDS"))
+		self.mod_role_ids = _parse_int_set(os.getenv("MOD_ROLE_IDS"))
+		self.prepis_role_ids = _parse_int_set(os.getenv("PREPIS_ROLE_IDS"))
+		self.admin_role_names = _parse_name_set(os.getenv("ADMIN_ROLE_NAMES"))
+		self.mod_role_names = _parse_name_set(os.getenv("MOD_ROLE_NAMES"))
+		self.prepis_role_names = _parse_name_set(os.getenv("PREPIS_ROLE_NAMES"))
 		self.pending_rewrites: dict[int, RewriteRequest] = {}
 		self.webhook_cache: dict[int, discord.Webhook] = {}
 		self.synced = False
@@ -158,10 +170,67 @@ class LSPDBot(commands.Bot):
 bot = LSPDBot()
 
 
+def _member_has_role(member: discord.Member, role_ids: set[int], role_names: set[str]) -> bool:
+	for role in member.roles:
+		if role.id in role_ids or role.name.casefold() in role_names:
+			return True
+	return False
+
+
+def _has_bot_access(member: discord.Member, access_level: str) -> bool:
+	if member.guild_permissions.administrator:
+		return True
+
+	if _member_has_role(member, bot.admin_role_ids, bot.admin_role_names):
+		return True
+
+	if access_level == "admin":
+		return False
+
+	if _member_has_role(member, bot.mod_role_ids, bot.mod_role_names):
+		return True
+
+	if access_level == "mod":
+		return False
+
+	if access_level == "prepis":
+		return _member_has_role(member, bot.prepis_role_ids, bot.prepis_role_names)
+
+	return False
+
+
 def _check_manage_messages(interaction: discord.Interaction) -> bool:
 	member = interaction.user
 	if isinstance(member, discord.Member):
-		return member.guild_permissions.manage_messages
+		return member.guild_permissions.manage_messages or _has_bot_access(member, "mod")
+	return False
+
+
+def _check_prepis_access(interaction: discord.Interaction) -> bool:
+	member = interaction.user
+	if isinstance(member, discord.Member):
+		return member.guild_permissions.manage_messages or _has_bot_access(member, "prepis")
+	return False
+
+
+def _check_kick_access(interaction: discord.Interaction) -> bool:
+	member = interaction.user
+	if isinstance(member, discord.Member):
+		return member.guild_permissions.kick_members or _has_bot_access(member, "mod")
+	return False
+
+
+def _check_ban_access(interaction: discord.Interaction) -> bool:
+	member = interaction.user
+	if isinstance(member, discord.Member):
+		return member.guild_permissions.ban_members or _has_bot_access(member, "admin")
+	return False
+
+
+def _check_timeout_access(interaction: discord.Interaction) -> bool:
+	member = interaction.user
+	if isinstance(member, discord.Member):
+		return member.guild_permissions.moderate_members or _has_bot_access(member, "mod")
 	return False
 
 
@@ -188,15 +257,14 @@ async def vymazat(interaction: discord.Interaction, pocet: app_commands.Range[in
 
 
 @bot.tree.command(name="kick", description="Vyhodí člena ze serveru")
-@app_commands.default_permissions(kick_members=True)
 @app_commands.describe(uzivatel="Uživatel k vyhození", duvod="Důvod")
 async def kick(
 	interaction: discord.Interaction,
 	uzivatel: discord.Member,
 	duvod: str = "Bez důvodu",
 ) -> None:
-	if not interaction.user.guild_permissions.kick_members:
-		await interaction.response.send_message("Nemáš oprávnění `kick_members`.", ephemeral=True)
+	if not _check_kick_access(interaction):
+		await interaction.response.send_message("Nemáš oprávnění pro `/kick`.", ephemeral=True)
 		return
 
 	await uzivatel.kick(reason=f"{duvod} | by {interaction.user}")
@@ -209,15 +277,14 @@ async def kick(
 
 
 @bot.tree.command(name="ban", description="Zabanuje člena serveru")
-@app_commands.default_permissions(ban_members=True)
 @app_commands.describe(uzivatel="Uživatel k banu", duvod="Důvod")
 async def ban(
 	interaction: discord.Interaction,
 	uzivatel: discord.Member,
 	duvod: str = "Bez důvodu",
 ) -> None:
-	if not interaction.user.guild_permissions.ban_members:
-		await interaction.response.send_message("Nemáš oprávnění `ban_members`.", ephemeral=True)
+	if not _check_ban_access(interaction):
+		await interaction.response.send_message("Nemáš oprávnění pro `/ban`.", ephemeral=True)
 		return
 
 	await uzivatel.ban(reason=f"{duvod} | by {interaction.user}")
@@ -230,7 +297,6 @@ async def ban(
 
 
 @bot.tree.command(name="timeout", description="Udělí timeout uživateli (v minutách)")
-@app_commands.default_permissions(moderate_members=True)
 @app_commands.describe(uzivatel="Uživatel", minuty="Délka timeoutu", duvod="Důvod")
 async def timeout(
 	interaction: discord.Interaction,
@@ -238,8 +304,8 @@ async def timeout(
 	minuty: app_commands.Range[int, 1, 40320],
 	duvod: str = "Bez důvodu",
 ) -> None:
-	if not interaction.user.guild_permissions.moderate_members:
-		await interaction.response.send_message("Nemáš oprávnění `moderate_members`.", ephemeral=True)
+	if not _check_timeout_access(interaction):
+		await interaction.response.send_message("Nemáš oprávnění pro `/timeout`.", ephemeral=True)
 		return
 
 	until = discord.utils.utcnow() + timedelta(minutes=minuty)
@@ -253,11 +319,10 @@ async def timeout(
 
 
 @bot.tree.command(name="odtimeout", description="Zruší timeout uživateli")
-@app_commands.default_permissions(moderate_members=True)
 @app_commands.describe(uzivatel="Uživatel")
 async def odtimeout(interaction: discord.Interaction, uzivatel: discord.Member) -> None:
-	if not interaction.user.guild_permissions.moderate_members:
-		await interaction.response.send_message("Nemáš oprávnění `moderate_members`.", ephemeral=True)
+	if not _check_timeout_access(interaction):
+		await interaction.response.send_message("Nemáš oprávnění pro `/odtimeout`.", ephemeral=True)
 		return
 
 	await uzivatel.edit(timed_out_until=None, reason=f"odtimeout by {interaction.user}")
@@ -269,29 +334,175 @@ async def odtimeout(interaction: discord.Interaction, uzivatel: discord.Member) 
 	)
 
 
-@bot.tree.command(name="prepis", description="Další tvoji zprávu bot přepošle pod zadaným jménem")
+DEFAULT_PREPIS_NAME = "Los Santos Police Department"
+
+
+class PrepisModal(discord.ui.Modal, title="Přepis zprávy"):
+	jmeno: discord.ui.TextInput = discord.ui.TextInput(
+		label="Jméno bota",
+		min_length=2,
+		max_length=32,
+	)
+	avatar_url: discord.ui.TextInput = discord.ui.TextInput(
+		label="URL avataru (volitelné)",
+		placeholder="https://example.com/avatar.png",
+		required=False,
+		max_length=512,
+	)
+
+	def __init__(self, default_name: str, default_avatar: str = "") -> None:
+		super().__init__()
+		self.jmeno.default = default_name
+		self.avatar_url.default = default_avatar
+
+	async def on_submit(self, interaction: discord.Interaction) -> None:
+		if not isinstance(interaction.channel, discord.TextChannel):
+			await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu.", ephemeral=True)
+			return
+
+		bot.pending_rewrites[interaction.user.id] = RewriteRequest(
+			channel_id=interaction.channel.id,
+			fake_name=self.jmeno.value,
+			avatar_url=self.avatar_url.value or None,
+		)
+		await interaction.response.send_message(
+			f"Pošli teď další zprávu. Smažu ji a přepošlu jako **{self.jmeno.value}**.",
+			ephemeral=True,
+		)
+
+
+@bot.tree.command(name="prepis", description="Přepošle tvoji další zprávu jako bot. Bez parametrů použije výchozí jméno.")
 @app_commands.describe(
-	jmeno="Jméno bota pro přepis", avatar_url="URL avataru (volitelné)")
+	jmeno="Vlastní jméno bota (otevře widget pro úpravu)",
+	avatar_url="URL vlastního avataru (otevře widget pro úpravu)",
+)
 async def prepis(
 	interaction: discord.Interaction,
-	jmeno: app_commands.Range[str, 2, 32],
+	jmeno: str | None = None,
 	avatar_url: str | None = None,
 ) -> None:
-	if not _check_manage_messages(interaction):
-		await interaction.response.send_message("Nemáš oprávnění `manage_messages`.", ephemeral=True)
+	if not _check_prepis_access(interaction):
+		await interaction.response.send_message("Nemáš oprávnění pro `/prepis`.", ephemeral=True)
 		return
 
 	if not isinstance(interaction.channel, discord.TextChannel):
 		await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu.", ephemeral=True)
 		return
 
-	bot.pending_rewrites[interaction.user.id] = RewriteRequest(
-		channel_id=interaction.channel.id,
-		fake_name=jmeno,
-		avatar_url=avatar_url,
+	# Žádný parametr → výchozí jméno, okamžitě bez widgetu
+	if jmeno is None and avatar_url is None:
+		bot.pending_rewrites[interaction.user.id] = RewriteRequest(
+			channel_id=interaction.channel.id,
+			fake_name=DEFAULT_PREPIS_NAME,
+			avatar_url=None,
+		)
+		await interaction.response.send_message(
+			f"Pošli teď další zprávu. Smažu ji a přepošlu jako **{DEFAULT_PREPIS_NAME}**.",
+			ephemeral=True,
+		)
+		return
+
+	# Alespoň jeden parametr → otevři modal s předvyplněnými hodnotami
+	modal = PrepisModal(
+		default_name=jmeno or DEFAULT_PREPIS_NAME,
+		default_avatar=avatar_url or "",
 	)
+	await interaction.response.send_modal(modal)
+
+
+# ---------------------------------------------------------------------------
+# /příkazy – interaktivní přehled příkazů bota
+# ---------------------------------------------------------------------------
+
+COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
+	"moderace": (
+		"🛡️ Moderační příkazy",
+		discord.Color.blue(),
+		[
+			("/kick", "Vyhodí člena ze serveru. Povoleno pro Discord `Kick Members` nebo bot roli **Admin/Mod**."),
+			("/ban", "Zabanuje člena serveru. Povoleno pro Discord `Ban Members` nebo bot roli **Admin**."),
+			("/timeout", "Udělí timeout uživateli. Povoleno pro Discord `Moderate Members` nebo bot roli **Admin/Mod**."),
+			("/odtimeout", "Zruší timeout. Povoleno pro Discord `Moderate Members` nebo bot roli **Admin/Mod**."),
+		],
+	),
+	"zprávy": (
+		"✉️ Příkazy pro zprávy",
+		discord.Color.green(),
+		[
+			("/vymazat", "Smaže 1–100 posledních zpráv. Povoleno pro Discord `Manage Messages` nebo bot roli **Admin/Mod**."),
+			(
+				"/prepis",
+				"Tvoji další zprávu bot přepošle jako webhook.\n"
+				"• Bez parametrů → odesláno jako **Los Santos Police Department**.\n"
+				"• S parametry `jméno`/`avatar_url` → otevře se widget pro úpravu.\n"
+				"• Povoleno pro Discord `Manage Messages` nebo bot roli **Admin/Mod/Prepis**.",
+			),
+		],
+	),
+	"automatizace": (
+		"⚙️ Automatizace & logy",
+		discord.Color.gold(),
+		[
+			("👁️ Auto-reakce", "V určených kanálech bot automaticky reaguje na každou zprávu emoji 👁️."),
+			("📥 Member join/leave", "Každý příchod a odchod člena je zaznamenán v log kanálu."),
+			("🗑️ Smazané zprávy", "Obsah smazané zprávy je automaticky uložen do logu."),
+			("✏️ Upravené zprávy", "Při editaci zprávy se do logu uloží verze před i po úpravě."),
+			("🧹 Purge log", "Každé použití `/vymazat` se zaznamená s počtem smazaných zpráv."),
+			("🕵️ Přepis log", "Každé použití `/prepis` se zaznamená včetně použitého jména."),
+		],
+	),
+}
+
+
+class KategoriePrikazuSelect(discord.ui.Select):
+	def __init__(self) -> None:
+		options = [
+			discord.SelectOption(label="Moderace", value="moderace", emoji="🛡️", description="kick, ban, timeout, odtimeout"),
+			discord.SelectOption(label="Zprávy", value="zprávy", emoji="✉️", description="vymazat, přepis"),
+			discord.SelectOption(label="Automatizace & logy", value="automatizace", emoji="⚙️", description="auto-reakce, logy"),
+		]
+		super().__init__(placeholder="Vyber kategorii příkazů…", options=options)
+
+	async def callback(self, interaction: discord.Interaction) -> None:
+		category = self.values[0]
+		title, color, fields = COMMAND_PAGES[category]
+		embed = discord.Embed(title=title, color=color)
+		embed.set_footer(text="LSPD Bot • Los Santos Police Department")
+		for name, desc in fields:
+			embed.add_field(name=name, value=desc, inline=False)
+		await interaction.response.edit_message(embed=embed, view=self.view)
+
+
+class PrikazyView(discord.ui.View):
+	def __init__(self) -> None:
+		super().__init__(timeout=120)
+		self.add_item(KategoriePrikazuSelect())
+
+	async def on_timeout(self) -> None:
+		for item in self.children:
+			if isinstance(item, discord.ui.Select):
+				item.disabled = True
+
+
+def _uvodni_embed() -> discord.Embed:
+	embed = discord.Embed(
+		title="📋 LSPD Bot – přehled příkazů",
+		description=(
+			"Vítej v interaktivním přehledu funkcí bota.\n"
+			"Pomocí menu níže si prohlédni dostupné příkazy podle kategorie."
+		),
+		color=discord.Color.dark_blue(),
+	)
+	embed.add_field(name="Kategorie", value="🛡️ Moderace  •  ✉️ Zprávy  •  ⚙️ Automatizace & logy", inline=False)
+	embed.set_footer(text="LSPD Bot • Los Santos Police Department")
+	return embed
+
+
+@bot.tree.command(name="příkazy", description="Zobrazí interaktivní přehled všech funkcí a příkazů bota")
+async def prikazy(interaction: discord.Interaction) -> None:
 	await interaction.response.send_message(
-		"Pošli teď další zprávu. Smažu ji a přepošlu jako bot.",
+		embed=_uvodni_embed(),
+		view=PrikazyView(),
 		ephemeral=True,
 	)
 
