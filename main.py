@@ -95,9 +95,9 @@ class LSPDBot(commands.Bot):
 		self.pending_rewrites: dict[int, RewriteRequest] = {}
 		self.webhook_cache: dict[int, discord.Webhook] = {}
 		self.synced = False
-		load_duty_records()
 
 	async def setup_hook(self) -> None:
+		load_duty_records()
 		if self.guild_id:
 			guild_obj = discord.Object(id=self.guild_id)
 			self.tree.copy_global_to(guild=guild_obj)
