@@ -1,8 +1,10 @@
 import logging
 import os
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.util import find_spec
+from pathlib import Path
 
 import discord
 from discord import app_commands
@@ -47,6 +49,19 @@ def _parse_name_set(value: str | None) -> set[str]:
 	return {item.strip().casefold() for item in value.split(",") if item.strip()}
 
 
+def _coerce_int(value: object, default: int = 0) -> int:
+	if isinstance(value, bool):
+		return int(value)
+	if isinstance(value, int):
+		return value
+	if isinstance(value, str):
+		try:
+			return int(value)
+		except ValueError:
+			return default
+	return default
+
+
 @dataclass(slots=True)
 class RewriteRequest:
 	channel_id: int
@@ -80,6 +95,7 @@ class LSPDBot(commands.Bot):
 		self.pending_rewrites: dict[int, RewriteRequest] = {}
 		self.webhook_cache: dict[int, discord.Webhook] = {}
 		self.synced = False
+		load_duty_records()
 
 	async def setup_hook(self) -> None:
 		if self.guild_id:
@@ -462,6 +478,12 @@ COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
 				"• Bot automaticky počítá délku aktuální i celkovou dobu ve službě.\n"
 				"• `/sluzba @člen` – zobrazí složku jiného člena (vyžaduje **mod/admin**).",
 			),
+			(
+				"/kontrola_duty",
+				"Zobrazí tabulkový přehled všech registrovaných složek včetně aktuální duty a celkového času.\n"
+				"• Výpis je seřazený tak, aby byli členové ve službě nahoře.\n"
+				"• Přístup mají pouze **mod/admin**.",
+			),
 		],
 	),
 }
@@ -589,6 +611,95 @@ class ServiceRecord:
 
 
 duty_records: dict[int, ServiceRecord] = {}
+SERVICE_RECORDS_PATH = Path(__file__).with_name("duty_records.json")
+
+
+def _serialize_datetime(value: datetime | None) -> str | None:
+	if value is None:
+		return None
+	return value.astimezone(timezone.utc).isoformat()
+
+
+def _deserialize_datetime(value: object) -> datetime | None:
+	if not isinstance(value, str) or not value:
+		return None
+	try:
+		parsed = datetime.fromisoformat(value)
+	except ValueError:
+		return None
+	if parsed.tzinfo is None:
+		return parsed.replace(tzinfo=timezone.utc)
+	return parsed.astimezone(timezone.utc)
+
+
+def _record_to_dict(record: ServiceRecord) -> dict[str, object]:
+	return {
+		"user_id": record.user_id,
+		"name": record.name,
+		"badge": record.badge,
+		"is_on_duty": record.is_on_duty,
+		"duty_start": _serialize_datetime(record.duty_start),
+		"total_minutes": record.total_minutes,
+		"last_service_end": _serialize_datetime(record.last_service_end),
+		"last_service_minutes": record.last_service_minutes,
+	}
+
+
+def _record_from_dict(data: object) -> ServiceRecord | None:
+	if not isinstance(data, dict):
+		return None
+	user_id = data.get("user_id")
+	name = data.get("name")
+	badge = data.get("badge")
+	if not isinstance(user_id, int) or not isinstance(name, str) or not isinstance(badge, str):
+		return None
+
+	return ServiceRecord(
+		user_id=user_id,
+		name=name,
+		badge=badge,
+		is_on_duty=bool(data.get("is_on_duty", False)),
+		duty_start=_deserialize_datetime(data.get("duty_start")),
+		total_minutes=_coerce_int(data.get("total_minutes", 0)),
+		last_service_end=_deserialize_datetime(data.get("last_service_end")),
+		last_service_minutes=_coerce_int(data.get("last_service_minutes", 0)),
+	)
+
+
+def load_duty_records() -> None:
+	if not SERVICE_RECORDS_PATH.exists():
+		return
+
+	try:
+		payload = json.loads(SERVICE_RECORDS_PATH.read_text(encoding="utf-8"))
+	except (OSError, json.JSONDecodeError) as exc:
+		logger.warning("Nepodařilo se načíst duty data z %s: %s", SERVICE_RECORDS_PATH, exc)
+		return
+
+	if not isinstance(payload, list):
+		logger.warning("Duty data v %s mají neplatný formát.", SERVICE_RECORDS_PATH)
+		return
+
+	duty_records.clear()
+	for item in payload:
+		record = _record_from_dict(item)
+		if record is None:
+			continue
+		if record.duty_start is None:
+			record.is_on_duty = False
+		duty_records[record.user_id] = record
+
+	logger.info("Načteno %s služebních složek z %s", len(duty_records), SERVICE_RECORDS_PATH)
+
+
+def save_duty_records() -> None:
+	serialized = [_record_to_dict(record) for record in duty_records.values()]
+	tmp_path = SERVICE_RECORDS_PATH.with_suffix(".json.tmp")
+	try:
+		tmp_path.write_text(json.dumps(serialized, ensure_ascii=False, indent=2), encoding="utf-8")
+		tmp_path.replace(SERVICE_RECORDS_PATH)
+	except OSError as exc:
+		logger.warning("Nepodařilo se uložit duty data do %s: %s", SERVICE_RECORDS_PATH, exc)
 
 
 def _fmt_duration(minutes: int) -> str:
@@ -597,10 +708,64 @@ def _fmt_duration(minutes: int) -> str:
 	return f"{h}h {m}m"
 
 
+def _fmt_duration_compact(minutes: int | None) -> str:
+	if minutes is None:
+		return "   --"
+	hours = minutes // 60
+	remaining_minutes = minutes % 60
+	return f"{hours:>4}:{remaining_minutes:02}"
+
+
+def _truncate_table_value(value: str, limit: int) -> str:
+	if len(value) <= limit:
+		return value
+	if limit <= 3:
+		return value[:limit]
+	return f"{value[:limit - 3]}..."
+
+
+def _current_session_minutes(record: ServiceRecord) -> int | None:
+	if not record.is_on_duty or record.duty_start is None:
+		return None
+	now = datetime.now(timezone.utc)
+	return int((now - record.duty_start).total_seconds() / 60)
+
+
+def _build_duty_table(records: list[ServiceRecord], max_rows: int = 20) -> tuple[str, int]:
+	sorted_records = sorted(
+		records,
+		key=lambda record: (
+			not record.is_on_duty,
+			record.name.casefold(),
+			record.badge.casefold(),
+		),
+	)
+	visible_records = sorted_records[:max_rows]
+	lines = [
+		"#  ODZNAK JMENO              STAV   AKTIVNI  CELKEM",
+		"-- ------ ------------------ ------ -------- --------",
+	]
+
+	for index, record in enumerate(visible_records, start=1):
+		status = "ONLINE" if record.is_on_duty else "MIMO"
+		current_minutes = _current_session_minutes(record)
+		lines.append(
+			f"{index:>2} "
+			f"{_truncate_table_value(record.badge, 6):<6} "
+			f"{_truncate_table_value(record.name, 18):<18} "
+			f"{status:<6} "
+			f"{_fmt_duration_compact(current_minutes):>8} "
+			f"{_fmt_duration_compact(record.total_minutes):>8}"
+		)
+
+	table = "```text\n" + "\n".join(lines) + "\n```"
+	remaining = max(0, len(sorted_records) - len(visible_records))
+	return table, remaining
+
+
 def _build_service_embed(record: ServiceRecord) -> discord.Embed:
-	if record.is_on_duty and record.duty_start:
-		now = datetime.now(timezone.utc)
-		session_minutes = int((now - record.duty_start).total_seconds() / 60)
+	session_minutes = _current_session_minutes(record)
+	if session_minutes is not None and record.duty_start:
 		session_str = _fmt_duration(session_minutes)
 		start_ts = int(record.duty_start.timestamp())
 		doba_value = f"od <t:{start_ts}:R> ({session_str})"
@@ -667,6 +832,7 @@ class ServiceView(discord.ui.View):
 		if record:
 			record.is_on_duty = True
 			record.duty_start = datetime.now(timezone.utc)
+			save_duty_records()
 		self._refresh_buttons()
 		await interaction.response.edit_message(embed=_build_service_embed(record), view=self)
 		if record:
@@ -689,6 +855,7 @@ class ServiceView(discord.ui.View):
 			record.last_service_minutes = session_min
 			record.is_on_duty = False
 			record.duty_start = None
+			save_duty_records()
 		self._refresh_buttons()
 		await interaction.response.edit_message(embed=_build_service_embed(record), view=self)
 		if record:
@@ -726,6 +893,7 @@ class RegisterModal(discord.ui.Modal, title="Registrace složky"):
 			badge=self.odznak.value,
 		)
 		duty_records[self.target_user.id] = record
+		save_duty_records()
 		view = ServiceView(self.target_user.id)
 		await self.original_message.edit(embed=_build_service_embed(record), view=view)
 		await bot.log_event(
@@ -802,6 +970,39 @@ async def sluzba(
 		return
 
 	await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+@bot.tree.command(name="kontrola_duty", description="Zobrazí přehled duty v tabulce")
+async def kontrola_duty(interaction: discord.Interaction) -> None:
+	if not (isinstance(interaction.user, discord.Member) and _has_bot_access(interaction.user, "mod")):
+		await interaction.response.send_message("Nemáš oprávnění zobrazit přehled duty.", ephemeral=True)
+		return
+
+	if not duty_records:
+		await interaction.response.send_message("Zatím neexistuje žádná registrovaná služební složka.", ephemeral=True)
+		return
+
+	records = list(duty_records.values())
+	on_duty_count = sum(1 for record in records if record.is_on_duty)
+	off_duty_count = len(records) - on_duty_count
+	table, remaining = _build_duty_table(records)
+
+	embed = discord.Embed(
+		title="📋 Přehled duty",
+		description=table,
+		color=discord.Color.blurple(),
+	)
+	embed.add_field(name="🟢 Ve službě", value=str(on_duty_count), inline=True)
+	embed.add_field(name="🔴 Mimo službu", value=str(off_duty_count), inline=True)
+	embed.add_field(name="👥 Celkem složek", value=str(len(records)), inline=True)
+	if remaining:
+		embed.add_field(
+			name="Poznámka",
+			value=f"Tabulka zobrazuje prvních 20 záznamů. Dalších skrytých: **{remaining}**.",
+			inline=False,
+		)
+	embed.set_footer(text="Aktuální stav služby a celkový odsloužený čas")
+	await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 def main() -> None:
