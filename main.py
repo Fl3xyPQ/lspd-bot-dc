@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import json
@@ -5,7 +6,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from importlib.util import find_spec
 from pathlib import Path
+from urllib.parse import urlparse
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -62,6 +65,14 @@ def _coerce_int(value: object, default: int = 0) -> int:
 	return default
 
 
+@dataclass(slots=True)
+class RewriteRequest:
+	channel_id: int
+	fake_name: str
+	avatar_url: str | None
+	avatar_bytes: bytes | None
+
+
 RewriteWebhookChannel = discord.TextChannel | discord.ForumChannel
 
 
@@ -88,6 +99,7 @@ class LSPDBot(commands.Bot):
 		self.admin_role_names = _parse_name_set(os.getenv("ADMIN_ROLE_NAMES"))
 		self.mod_role_names = _parse_name_set(os.getenv("MOD_ROLE_NAMES"))
 		self.prepis_role_names = _parse_name_set(os.getenv("PREPIS_ROLE_NAMES"))
+		self.pending_rewrites: dict[int, RewriteRequest] = {}
 		self.webhook_cache: dict[int, discord.Webhook] = {}
 		self.synced = False
 
@@ -152,6 +164,55 @@ class LSPDBot(commands.Bot):
 			except discord.DiscordException:
 				pass
 
+		pending = self.pending_rewrites.get(message.author.id)
+		if pending and pending.channel_id == message.channel.id:
+			webhook_channel = _resolve_rewrite_webhook_channel(message.channel)
+			if webhook_channel is None:
+				self.pending_rewrites.pop(message.author.id, None)
+				return
+
+			self.pending_rewrites.pop(message.author.id, None)
+			content = message.content
+			files = [await attachment.to_file() for attachment in message.attachments]
+
+			try:
+				await message.delete()
+			except discord.DiscordException:
+				pass
+
+			cleanup_webhook = False
+			if pending.avatar_bytes is None:
+				webhook = await self.get_or_create_webhook(webhook_channel)
+			else:
+				webhook = await webhook_channel.create_webhook(
+					name="LSPD Rewrite Custom Avatar",
+					avatar=pending.avatar_bytes,
+					reason=f"Temporary rewrite webhook for {message.author}",
+				)
+				cleanup_webhook = True
+			webhook_kwargs = {
+				"content": content if content else None,
+				"username": pending.fake_name,
+				"files": files,
+				"allowed_mentions": discord.AllowedMentions.none(),
+			}
+			if isinstance(message.channel, discord.Thread):
+				webhook_kwargs["thread"] = message.channel
+
+			try:
+				await webhook.send(**webhook_kwargs)
+			finally:
+				if cleanup_webhook:
+					try:
+						await webhook.delete(reason="Temporary rewrite webhook cleanup")
+					except discord.DiscordException as exc:
+						logger.warning("Temporary rewrite webhook cleanup failed: %s", exc)
+			await self.log_event(
+				"🕵️ Přepis zprávy",
+				f"Uživatel {message.author.mention} přepsal zprávu v {message.channel.mention} jako **{pending.fake_name}**.",
+				discord.Color.orange(),
+			)
+
 
 bot = LSPDBot()
 
@@ -207,33 +268,34 @@ def _resolve_rewrite_webhook_channel(channel: discord.abc.GuildChannel | discord
 	return None
 
 
-async def _send_rewrite_message(
-	interaction: discord.Interaction,
-	content: str,
-	fake_name: str,
-	avatar_url: str | None,
-) -> None:
-	channel = interaction.channel
-	webhook_channel = _resolve_rewrite_webhook_channel(channel)
-	if webhook_channel is None:
-		raise ValueError("Unsupported rewrite channel")
+def _normalize_avatar_url(value: str | None) -> str | None:
+	if value is None:
+		return None
+	normalized = value.strip()
+	if not normalized:
+		return None
+	parsed = urlparse(normalized)
+	if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+		return None
+	return normalized
 
-	webhook = await bot.get_or_create_webhook(webhook_channel)
-	webhook_kwargs = {
-		"content": content,
-		"username": fake_name,
-		"avatar_url": avatar_url,
-		"allowed_mentions": discord.AllowedMentions.none(),
-	}
-	if isinstance(channel, discord.Thread):
-		webhook_kwargs["thread"] = channel
 
-	await webhook.send(**webhook_kwargs)
-	await bot.log_event(
-		"🕵️ Přepis zprávy",
-		f"Uživatel {interaction.user.mention} přepsal zprávu v {channel.mention} jako **{fake_name}**.",
-		discord.Color.orange(),
-	)
+async def _download_avatar_bytes(avatar_url: str) -> bytes:
+	timeout = aiohttp.ClientTimeout(total=15)
+	async with aiohttp.ClientSession(timeout=timeout) as session:
+		async with session.get(avatar_url) as response:
+			response.raise_for_status()
+			avatar_bytes = await response.read()
+
+	if not avatar_bytes:
+		raise ValueError("Avatar image is empty")
+
+	try:
+		discord.utils._get_mime_type_for_image(avatar_bytes)
+	except ValueError as exc:
+		raise ValueError("Avatar URL must point directly to a PNG, JPEG, GIF, or WEBP image") from exc
+
+	return avatar_bytes
 
 
 def _check_kick_access(interaction: discord.Interaction) -> bool:
@@ -361,12 +423,6 @@ DEFAULT_PREPIS_NAME = "Los Santos Police Department"
 
 
 class PrepisModal(discord.ui.Modal, title="Přepis zprávy"):
-	zprava: discord.ui.TextInput = discord.ui.TextInput(
-		label="Zpráva",
-		style=discord.TextStyle.paragraph,
-		min_length=1,
-		max_length=2000,
-	)
 	jmeno: discord.ui.TextInput = discord.ui.TextInput(
 		label="Jméno bota",
 		min_length=2,
@@ -379,9 +435,8 @@ class PrepisModal(discord.ui.Modal, title="Přepis zprávy"):
 		max_length=512,
 	)
 
-	def __init__(self, default_message: str, default_name: str, default_avatar: str = "") -> None:
+	def __init__(self, default_name: str, default_avatar: str = "") -> None:
 		super().__init__()
-		self.zprava.default = default_message
 		self.jmeno.default = default_name
 		self.avatar_url.default = default_avatar
 
@@ -390,27 +445,38 @@ class PrepisModal(discord.ui.Modal, title="Přepis zprávy"):
 			await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu nebo ve vláknu fóra.", ephemeral=True)
 			return
 
-		await _send_rewrite_message(
-			interaction=interaction,
-			content=self.zprava.value,
+		avatar_value = self.avatar_url.value
+		avatar_url = _normalize_avatar_url(avatar_value)
+		avatar_bytes: bytes | None = None
+		if avatar_value and avatar_url is None:
+			await interaction.response.send_message("Avatar URL musí být platný HTTP/HTTPS odkaz na obrázek.", ephemeral=True)
+			return
+		if avatar_url is not None:
+			try:
+				avatar_bytes = await _download_avatar_bytes(avatar_url)
+			except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+				await interaction.response.send_message(f"Avatar se nepodařilo načíst: {exc}", ephemeral=True)
+				return
+
+		bot.pending_rewrites[interaction.user.id] = RewriteRequest(
+			channel_id=interaction.channel.id,
 			fake_name=self.jmeno.value,
-			avatar_url=self.avatar_url.value or None,
+			avatar_url=avatar_url,
+			avatar_bytes=avatar_bytes,
 		)
 		await interaction.response.send_message(
-			f"Zpráva byla odeslána jako **{self.jmeno.value}**.",
+			f"Pošli teď další zprávu. Smažu ji a přepošlu jako **{self.jmeno.value}**.",
 			ephemeral=True,
 		)
 
 
-@bot.tree.command(name="prepis", description="Odešle zprávu jako bot. S jménem nebo avatar URL otevře widget.")
+@bot.tree.command(name="prepis", description="Přepošle tvoji další zprávu jako bot. Bez parametrů použije výchozí jméno.")
 @app_commands.describe(
-	zprava="Text zprávy k odeslání",
 	jmeno="Vlastní jméno autora",
 	avatar_url="URL vlastního avataru (nepovinné)",
 )
 async def prepis(
 	interaction: discord.Interaction,
-	zprava: app_commands.Range[str, 1, 2000],
 	jmeno: str | None = None,
 	avatar_url: str | None = None,
 ) -> None:
@@ -422,23 +488,22 @@ async def prepis(
 		await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu nebo ve vláknu fóra.", ephemeral=True)
 		return
 
-	# Jen zpráva → odešli rovnou bez widgetu
+	# Žádný parametr → výchozí jméno, okamžitě bez widgetu
 	if jmeno is None and avatar_url is None:
-		await _send_rewrite_message(
-			interaction=interaction,
-			content=zprava,
+		bot.pending_rewrites[interaction.user.id] = RewriteRequest(
+			channel_id=interaction.channel.id,
 			fake_name=DEFAULT_PREPIS_NAME,
 			avatar_url=None,
+			avatar_bytes=None,
 		)
 		await interaction.response.send_message(
-			f"Zpráva byla odeslána jako **{DEFAULT_PREPIS_NAME}**.",
+			f"Pošli teď další zprávu. Smažu ji a přepošlu jako **{DEFAULT_PREPIS_NAME}**.",
 			ephemeral=True,
 		)
 		return
 
 	# Alespoň jeden parametr → otevři modal s předvyplněnými hodnotami
 	modal = PrepisModal(
-		default_message=zprava,
 		default_name=jmeno or DEFAULT_PREPIS_NAME,
 		default_avatar=avatar_url or "",
 	)
@@ -467,9 +532,9 @@ COMMAND_PAGES: dict[str, tuple[str, discord.Color, list[tuple[str, str]]]] = {
 			("/vymazat", "Smaže 1–100 posledních zpráv. Povoleno pro Discord `Manage Messages` nebo **administrátory**."),
 			(
 				"/prepis",
-				"Bot odešle zadanou zprávu jako webhook.\n"
-				"• Jen `zpráva` → odešle se rovnou jako **Los Santos Police Department**.\n"
-				"• S parametry `jméno`/`avatar_url` → otevře se widget pro úpravu a odeslání.\n"
+				"Tvoji další zprávu bot přepošle jako webhook.\n"
+				"• Bez parametrů → odesláno jako **Los Santos Police Department**.\n"
+				"• S parametry `jméno`/`avatar_url` → otevře se widget pro úpravu.\n"
 				"• Povoleno pro Discord `Manage Messages` nebo **administrátory**.",
 			),
 		],
