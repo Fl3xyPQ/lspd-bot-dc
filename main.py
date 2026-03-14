@@ -69,6 +69,9 @@ class RewriteRequest:
 	avatar_url: str | None
 
 
+RewriteWebhookChannel = discord.TextChannel | discord.ForumChannel
+
+
 class LSPDBot(commands.Bot):
 	def __init__(self) -> None:
 		intents = discord.Intents.default()
@@ -132,7 +135,7 @@ class LSPDBot(commands.Bot):
 		except discord.DiscordException as exc:
 			logger.warning("Log send failed: %s", exc)
 
-	async def get_or_create_webhook(self, channel: discord.TextChannel) -> discord.Webhook:
+	async def get_or_create_webhook(self, channel: RewriteWebhookChannel) -> discord.Webhook:
 		cached = self.webhook_cache.get(channel.id)
 		if cached:
 			return cached
@@ -158,7 +161,12 @@ class LSPDBot(commands.Bot):
 				pass
 
 		pending = self.pending_rewrites.get(message.author.id)
-		if pending and pending.channel_id == message.channel.id and isinstance(message.channel, discord.TextChannel):
+		if pending and pending.channel_id == message.channel.id:
+			webhook_channel = _resolve_rewrite_webhook_channel(message.channel)
+			if webhook_channel is None:
+				self.pending_rewrites.pop(message.author.id, None)
+				return
+
 			self.pending_rewrites.pop(message.author.id, None)
 			content = message.content
 			files = [await attachment.to_file() for attachment in message.attachments]
@@ -168,14 +176,18 @@ class LSPDBot(commands.Bot):
 			except discord.DiscordException:
 				pass
 
-			webhook = await self.get_or_create_webhook(message.channel)
-			await webhook.send(
-				content=content if content else None,
-				username=pending.fake_name,
-				avatar_url=pending.avatar_url,
-				files=files,
-				allowed_mentions=discord.AllowedMentions.none(),
-			)
+			webhook = await self.get_or_create_webhook(webhook_channel)
+			webhook_kwargs = {
+				"content": content if content else None,
+				"username": pending.fake_name,
+				"avatar_url": pending.avatar_url,
+				"files": files,
+				"allowed_mentions": discord.AllowedMentions.none(),
+			}
+			if isinstance(message.channel, discord.Thread):
+				webhook_kwargs["thread"] = message.channel
+
+			await webhook.send(**webhook_kwargs)
 			await self.log_event(
 				"🕵️ Přepis zprávy",
 				f"Uživatel {message.author.mention} přepsal zprávu v {message.channel.mention} jako **{pending.fake_name}**.",
@@ -227,6 +239,14 @@ def _check_prepis_access(interaction: discord.Interaction) -> bool:
 	if isinstance(member, discord.Member):
 		return member.guild_permissions.manage_messages or _has_bot_access(member, "prepis")
 	return False
+
+
+def _resolve_rewrite_webhook_channel(channel: discord.abc.GuildChannel | discord.Thread | None) -> RewriteWebhookChannel | None:
+	if isinstance(channel, discord.TextChannel | discord.ForumChannel):
+		return channel
+	if isinstance(channel, discord.Thread) and isinstance(channel.parent, discord.ForumChannel):
+		return channel.parent
+	return None
 
 
 def _check_kick_access(interaction: discord.Interaction) -> bool:
@@ -372,8 +392,8 @@ class PrepisModal(discord.ui.Modal, title="Přepis zprávy"):
 		self.avatar_url.default = default_avatar
 
 	async def on_submit(self, interaction: discord.Interaction) -> None:
-		if not isinstance(interaction.channel, discord.TextChannel):
-			await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu.", ephemeral=True)
+		if _resolve_rewrite_webhook_channel(interaction.channel) is None:
+			await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu nebo ve vláknu fóra.", ephemeral=True)
 			return
 
 		bot.pending_rewrites[interaction.user.id] = RewriteRequest(
@@ -401,8 +421,8 @@ async def prepis(
 		await interaction.response.send_message("Nemáš oprávnění pro `/prepis`.", ephemeral=True)
 		return
 
-	if not isinstance(interaction.channel, discord.TextChannel):
-		await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu.", ephemeral=True)
+	if _resolve_rewrite_webhook_channel(interaction.channel) is None:
+		await interaction.response.send_message("Příkaz lze použít jen v textovém kanálu nebo ve vláknu fóra.", ephemeral=True)
 		return
 
 	# Žádný parametr → výchozí jméno, okamžitě bez widgetu
